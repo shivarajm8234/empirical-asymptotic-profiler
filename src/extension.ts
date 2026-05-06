@@ -68,18 +68,19 @@ function getWebviewContent(result: AnalysisResult) {
 		</div>`
 		: '';
 
+	const chartTitle = result.analysisMode === 'empirical' ? 'Empirical Growth Curve' : 'Theoretical Growth Curve (Structural Analysis)';
+	const chartLabel = result.analysisMode === 'empirical' ? 'Measured (median)' : 'Theoretical ' + result.timeComplexity;
+	const chartColor = result.analysisMode === 'empirical' ? '#007acc' : '#ff9800';
+
 	const chartBlock = result.empiricalData.length > 0
 		? `<div class="card">
-			<h2>Empirical Growth Curve</h2>
+			<h2>${chartTitle}</h2>
 			<p style="margin:0 0 6px;font-size:0.9em;opacity:0.8"><strong>Best fit:</strong> ${result.regressionFormula}</p>
 			<div class="chart-container">
 				<canvas id="chart"></canvas>
 			</div>
 		</div>`
-		: `<div class="card">
-			<h2>Empirical Growth Curve</h2>
-			<p style="opacity:0.7">No runtime data available. Analysis was performed using structural pattern matching.</p>
-		</div>`;
+		: '';
 
 	return `
 <!DOCTYPE html>
@@ -347,10 +348,10 @@ function getWebviewContent(result: AnalysisResult) {
 			data: {
 				datasets: [
 					{
-						label: 'Measured (median)',
+						label: '${chartLabel}',
 						data: empiricalData.map(d => ({ x: d.n, y: d.time })),
-						borderColor: '#007acc',
-						backgroundColor: '#007acc',
+						borderColor: '${chartColor}',
+						backgroundColor: '${chartColor}',
 						pointRadius: 5,
 						pointHoverRadius: 7,
 						showLine: true,
