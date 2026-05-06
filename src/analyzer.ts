@@ -68,22 +68,53 @@ export interface AnalysisResult {
     warnings: string[];
 }
 
+// ─── Complexity Magnitudes ───────────────────────────────────────────────────
+
+enum Magnitude {
+    CONSTANT = 0,
+    LOG = 1,
+    LINEAR = 2,
+    LINEARITHMIC = 3,
+    QUADRATIC = 4,
+    CUBIC = 5,
+    EXPONENTIAL = 6,
+}
+
+const MagnitudeMap: Record<Magnitude, string> = {
+    [Magnitude.CONSTANT]: 'O(1)',
+    [Magnitude.LOG]: 'O(log n)',
+    [Magnitude.LINEAR]: 'O(n)',
+    [Magnitude.LINEARITHMIC]: 'O(n log n)',
+    [Magnitude.QUADRATIC]: 'O(n^2)',
+    [Magnitude.CUBIC]: 'O(n^3)',
+    [Magnitude.EXPONENTIAL]: 'O(2^n)',
+};
+
+interface ComplexityHeuristic {
+    magnitude: Magnitude;
+    confidence: number;
+    explanation: string;
+}
+
 // ─── Code Feature Detector ─────────────────────────────────────────────────────
 
 interface CodeFeatures {
     functionName: string;
     rawArgs: string;
     language: string;
-    loopCount: number;
-    maxNestingDepth: number;
+    lineCount: number;
     hasRecursion: boolean;
-    hasRandomization: boolean;
+    recursionCalls: number;
+    maxNesting: number;
+    relevantParams: string[];
+    // Computed heuristic flags
     hasAllocation: boolean;
+    hasRandomization: boolean;
     hasSorting: boolean;
     hasHashMap: boolean;
     hasBinarySearch: boolean;
     hasDivideConquer: boolean;
-    lineCount: number;
+    loopCount: number;
 }
 
 /**
@@ -139,15 +170,16 @@ function computeNestingDepth(code: string): number {
 }
 
 function detectFeatures(code: string): CodeFeatures {
-    // Extract function name — support JS, TS, Java, C, C++, Python
+    const lines = code.split('\n');
+    
+    // Extract Function Metadata
     const funcPatterns = [
-        /(?:function|async\s+function)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\((.*?)\)/,
-        /(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>/,
-        /(?:public|private|protected|static)?\s*(?:void|int|long|String|boolean|float|double|char)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\((.*?)\)/,
-        /def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)\)/,
+        /(?:function|async\s+function|def)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\((.*?)\)/,
+        /(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*.*=>/,
+        /(?:void|int|long|String|float|double)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\((.*?)\)/,
     ];
 
-    let functionName = 'anonymous_function';
+    let functionName = 'anonymous';
     let rawArgs = '';
     for (const pat of funcPatterns) {
         const m = code.match(pat);
@@ -158,53 +190,108 @@ function detectFeatures(code: string): CodeFeatures {
         }
     }
 
-    // Detect language
-    let language = 'JavaScript';
-    if (/:\s*(number|string|boolean|void)\b/.test(code)) language = 'TypeScript';
-    else if (/public\s+static\s+void\s+main|System\.out\.println/.test(code)) language = 'Java';
-    else if (/def\s+\w+\s*\(|print\s*\(/.test(code) && !/(function|=>|const|let|var)/.test(code)) language = 'Python';
-    else if (/#include|printf|scanf|int\s+main/.test(code)) language = 'C/C++';
+    const args = rawArgs.split(',').map(a => a.trim().split(/\s+/).pop() || '').filter(Boolean);
+    const relevantParams = args.filter(a => new RegExp(`\\b${a}\\b`).test(code));
 
-    // Loop counting — more generic to support Python and functional styles
-    const forLoops = (code.match(/\bfor\b/g) || []).length;
-    const whileLoops = (code.match(/\bwhile\b/g) || []).length;
-    const mapLoops = (code.match(/\.(map|forEach|filter|reduce)\s*\(/g) || []).length;
-    const loopCount = forLoops + whileLoops + mapLoops;
+    // Nesting & Recursion
+    const maxNesting = computeNestingDepth(code);
+    const bodyOnly = code.substring(code.indexOf('{') > -1 ? code.indexOf('{') : 0);
+    const recursionMatches = bodyOnly.match(new RegExp(`\\b${functionName}\\s*\\(`, 'g')) || [];
 
-    // Proper nesting depth (supports braces and indentation)
-    const maxNestingDepth = computeNestingDepth(code);
-
-    // Recursion: function calls itself (excluding the declaration line)
-    const bodyCode = code.replace(/(?:function|def|void|int)\s+\w+\s*\([^)]*\)/, '');
-    const hasRecursion = new RegExp(`\\b${functionName}\\s*\\(`).test(bodyCode);
-
+    // Basic heuristic flags (Data-driven)
+    const hasAllocation = /new\s+[A-Z]|\[\]|malloc|calloc|ArrayList|HashMap/i.test(code);
     const hasRandomization = /Math\.random|random\(\)|rand\(\)|shuffle/i.test(code);
-    const hasAllocation = /new\s+[A-Z]|\[\]|malloc|calloc|ArrayList|HashMap|new\s+Array/i.test(code);
-    const hasSorting = /\.sort\(|Arrays\.sort|sorted\(|qsort|Collections\.sort/i.test(code);
-    const hasHashMap = /Map\s*\(|HashMap|dict\s*\(|new\s+Map|new\s+Set|\bSet\s*\(/i.test(code);
+    const hasSorting = /\.sort\(|Arrays\.sort|sorted\(/i.test(code);
+    const hasHashMap = /Map\s*\(|HashMap|dict\s*\(|new\s+Map/i.test(code);
     const hasBinarySearch = /mid\s*=|lo\s*<\s*hi|left\s*<\s*right|binary.?search/i.test(code);
-    const hasDivideConquer = hasRecursion && (hasBinarySearch || /merge|partition|pivot/i.test(code));
-
-    const lineCount = code.split('\n').length;
+    const hasDivideConquer = (recursionMatches.length > 0) && (/merge|partition|pivot|mid/i.test(code));
+    const loopCount = (code.match(/\b(for|while|forEach|map)\b/g) || []).length;
 
     return {
-        functionName, rawArgs, language, loopCount, maxNestingDepth,
-        hasRecursion, hasRandomization, hasAllocation, hasSorting,
-        hasHashMap, hasBinarySearch, hasDivideConquer, lineCount,
+        functionName,
+        rawArgs,
+        language: 'detected',
+        lineCount: lines.length,
+        hasRecursion: recursionMatches.length > 0,
+        recursionCalls: recursionMatches.length,
+        maxNesting,
+        relevantParams,
+        hasAllocation,
+        hasRandomization,
+        hasSorting,
+        hasHashMap,
+        hasBinarySearch,
+        hasDivideConquer,
+        loopCount
     };
 }
 
-/**
- * Library of known patterns and their typical complexity signatures.
- * This prevents hardcoding in the main logic flow.
- */
-const DOMAIN_COMPLEXITY_MAP = [
-    { pattern: /\.fit\(|\.train\(|SGD|GradientDescent|Adam\(/i, bigO: 'O(epochs * n * d)', confidence: 0.82, reason: 'ML training detected' },
-    { pattern: /\.predict\(|ForwardPass/i, bigO: 'O(n * d)', confidence: 0.88, reason: 'ML inference detected' },
-    { pattern: /matmul|dot\s*\(|\.dot\(|@\s*[a-zA-Z]/i, bigO: 'O(n^3)', confidence: 0.90, reason: 'Matrix multiplication detected' },
-    { pattern: /sha256|keccak|blockchain|ProofOfWork|mineBlock/i, bigO: 'O(2^d)', confidence: 0.75, reason: 'Cryptographic hashing / Proof of Work detected' },
-    { pattern: /Conv2D|MaxPooling|Flatten\(/i, bigO: 'O(w * h * c * k)', confidence: 0.85, reason: 'CNN operations detected' },
-    { pattern: /Sparse|CSR|COO/i, bigO: 'O(nnz)', confidence: 0.80, reason: 'Sparse matrix operations detected' },
+// ─── Heuristic Registry ───────────────────────────────────────────────────────
+
+interface Detector {
+    name: string;
+    detect: (code: string, features: CodeFeatures) => ComplexityHeuristic | null;
+}
+
+const HEURISTIC_DETECTORS: Detector[] = [
+    {
+        name: 'DomainSignatures',
+        detect: (code) => {
+            const signatures = [
+                { reg: /\.fit\(|\.train\(|Adam\(|SGD/i, mag: Magnitude.LINEAR, exp: 'Machine Learning Training pattern' },
+                { reg: /matmul|dot\s*\(|@\s*[a-zA-Z]/i, mag: Magnitude.CUBIC, exp: 'Matrix Multiplication pattern' },
+                { reg: /sha256|keccak|ProofOfWork/i, mag: Magnitude.EXPONENTIAL, exp: 'Cryptographic Hashing / PoW pattern' },
+                { reg: /\.sort\(|Arrays\.sort|sorted\(/i, mag: Magnitude.LINEARITHMIC, exp: 'Standard Sorting pattern' },
+            ];
+            for (const s of signatures) {
+                if (s.reg.test(code)) return { magnitude: s.mag, confidence: 0.85, explanation: s.exp };
+            }
+            return null;
+        }
+    },
+    {
+        name: 'LoopStructural',
+        detect: (code, f) => {
+            if (f.maxNesting === 0) return null;
+            
+            const hasHalving = /\/=\s*2|>>=\s*1|floor\(.+\/2\)|range\(.+,.+,.+\*2\)/i.test(code);
+            
+            if (f.maxNesting === 1) {
+                return { 
+                    magnitude: hasHalving ? Magnitude.LOG : Magnitude.LINEAR, 
+                    confidence: 0.90, 
+                    explanation: `Single-level loop detected (${hasHalving ? 'Halving' : 'Linear'} iteration).` 
+                };
+            }
+            if (f.maxNesting === 2) {
+                const mag = f.relevantParams.length >= 2 ? Magnitude.LINEAR : Magnitude.QUADRATIC;
+                return { 
+                    magnitude: mag, 
+                    confidence: 0.85, 
+                    explanation: `Nested loop structure detected (${f.relevantParams.length >= 2 ? 'Multi-param' : 'Quadratic'}).` 
+                };
+            }
+            if (f.maxNesting >= 3) {
+                return { magnitude: Magnitude.CUBIC, confidence: 0.80, explanation: `Deeply nested loops (${f.maxNesting} levels).` };
+            }
+            return null;
+        }
+    },
+    {
+        name: 'RecursionAnalysis',
+        detect: (code, f) => {
+            if (!f.hasRecursion) return null;
+            if (f.recursionCalls >= 2) {
+                return { magnitude: Magnitude.EXPONENTIAL, confidence: 0.80, explanation: 'Multiple branching recursion (e.g. Fibonacci/Trees).' };
+            }
+            const hasHalving = /\/2|>>1|mid/i.test(code);
+            return { 
+                magnitude: hasHalving ? Magnitude.LOG : Magnitude.LINEAR, 
+                confidence: 0.75, 
+                explanation: `Linear/Logarithmic recursion depth detected.` 
+            };
+        }
+    }
 ];
 
 function inferComplexityStatically(features: CodeFeatures, code: string): {
@@ -212,56 +299,29 @@ function inferComplexityStatically(features: CodeFeatures, code: string): {
     confidence: number;
     explanation: string;
 } {
-    // 1. Domain-Specific Pattern Matching (from map)
-    for (const entry of DOMAIN_COMPLEXITY_MAP) {
-        if (entry.pattern.test(code)) {
-            return { bigO: entry.bigO, confidence: entry.confidence, explanation: `${entry.reason} — using domain-specific signature.` };
-        }
-    }
-
-    // 2. Multi-Parameter Detection
-    const args = features.rawArgs.split(',').map(a => a.trim()).filter(a => a && !a.includes(':'));
-    const relevantArgs = args.filter(a => new RegExp(`\\b${a}\\b`).test(code));
+    const results: ComplexityHeuristic[] = [];
     
-    // 3. Loop Body Logic Analysis (Detection of halving/logarithmic patterns)
-    const hasHalving = /\/=\s*2|>>=\s*1|floor\(.+\/2\)|range\(.+,.+,.+\*2\)/i.test(code);
-    const loopTime = hasHalving ? 'log n' : 'n';
-
-    // 4. Algorithm Signature Matching
-    if (features.hasSorting && !features.hasRecursion) {
-        return { bigO: 'O(n log n)', confidence: 0.92, explanation: 'Standard comparison sort signature detected.' };
-    }
-    if (features.hasBinarySearch || (features.loopCount > 0 && hasHalving)) {
-        return { bigO: 'O(log n)', confidence: 0.88, explanation: 'Logarithmic search/iteration pattern detected (halving logic).' };
-    }
-    if (features.hasDivideConquer) {
-        return { bigO: 'O(n log n)', confidence: 0.85, explanation: 'Divide & Conquer recursion detected (halving with linear merge/partition).' };
+    for (const detector of HEURISTIC_DETECTORS) {
+        const h = detector.detect(code, features);
+        if (h) results.push(h);
     }
 
-    // 5. Recursive Complexity
-    if (features.hasRecursion) {
-        const bodyWithoutDecl = code.substring(code.indexOf('{') > -1 ? code.indexOf('{') : 0);
-        const calls = (bodyWithoutDecl.match(new RegExp(`\\b${features.functionName}\\s*\\(`, 'g')) || []).length;
-        if (calls >= 2) return { bigO: 'O(2^n)', confidence: 0.78, explanation: 'Multiple branching recursion detected (Exponential growth).' };
-        return { bigO: `O(${loopTime})`, confidence: 0.70, explanation: `Linear/Logarithmic recursion depth detected.` };
+    if (results.length === 0) {
+        return { bigO: 'O(1)', confidence: 0.95, explanation: 'No iteration or recursion detected.' };
     }
 
-    // 6. Structural Loop Nesting
-    if (features.maxNestingDepth >= 3) {
-        return { bigO: 'O(n^3)', confidence: 0.80, explanation: `Triple-nested loop structure (Nesting Depth: ${features.maxNestingDepth}).` };
-    }
-    if (features.maxNestingDepth === 2) {
-        // Check if it's O(n*m)
-        if (relevantArgs.length >= 2) {
-            return { bigO: `O(${relevantArgs[0]} * ${relevantArgs[1]})`, confidence: 0.85, explanation: 'Nested iteration over multiple input parameters.' };
-        }
-        return { bigO: 'O(n^2)', confidence: 0.85, explanation: 'Double-nested loop detected (Quadratic scaling).' };
-    }
-    if (features.maxNestingDepth === 1 || features.loopCount > 0) {
-        return { bigO: `O(${loopTime})`, confidence: 0.90, explanation: `Single level iteration detected (${loopTime} scaling).` };
-    }
+    // Combine results: Take the highest magnitude detected as the primary complexity
+    results.sort((a, b) => b.magnitude - a.magnitude);
+    const best = results[0];
+    
+    // Adjust confidence based on agreement between detectors
+    const avgConfidence = results.reduce((sum, r) => sum + r.confidence, 0) / results.length;
 
-    return { bigO: 'O(1)', confidence: 0.95, explanation: 'No loops or recursion detected (Constant time).' };
+    return {
+        bigO: MagnitudeMap[best.magnitude],
+        confidence: avgConfidence,
+        explanation: results.map(r => r.explanation).join(' | ')
+    };
 }
 
 // ─── Theoretical Curve Generator ────────────────────────────────────────────────
@@ -300,7 +360,7 @@ function inferSpaceComplexity(code: string, features: CodeFeatures): string {
     const allocInLoop = /(?:for|while)[^}]*(?:new |push\(|append\(|\[\])/s.test(code);
 
     if (allocInLoop) {
-        if (features.maxNestingDepth >= 2) return 'O(n^2) — Nested allocation detected';
+        if (features.maxNesting >= 2) return 'O(n^2) — Nested allocation detected';
         return 'O(n) — Linear allocation inside loop';
     }
     if (features.hasRecursion) {
@@ -387,7 +447,7 @@ function generateExplanation(
 
     if (analysisMode === 'empirical' && fitResult) {
         classroom.push(
-            `Step 1: Identified function "${features.functionName}" with ${features.loopCount} loop(s), max nesting depth ${features.maxNestingDepth}.`,
+            `Step 1: Identified function "${features.functionName}" with ${features.loopCount} loop(s), max nesting depth ${features.maxNesting}.`,
             `Step 2: Generated synthetic inputs at N = [${data.map(d => d.n).join(', ')}].`,
             `Step 3: Executed ${data.length * 7} benchmark runs (7 iterations per size, median taken after outlier trimming).`,
             `Step 4: Applied JIT warmup (3 dry runs) before each measurement to eliminate V8 optimization bias.`,
@@ -402,7 +462,7 @@ function generateExplanation(
         classroom.push(
             `Step 1: Identified function "${features.functionName}" (${features.language}).`,
             `Step 2: Runtime profiling unavailable for ${features.language} — switched to structural analysis.`,
-            `Step 3: Analyzed ${features.loopCount} loop(s), maximum nesting depth = ${features.maxNestingDepth}.`,
+            `Step 3: Analyzed ${features.loopCount} loop(s), maximum nesting depth = ${features.maxNesting}.`,
             `Step 4: Recursion ${features.hasRecursion ? 'detected' : 'not detected'}.`,
             `Step 5: Algorithm patterns checked: sorting=${features.hasSorting}, binary search=${features.hasBinarySearch}, divide-and-conquer=${features.hasDivideConquer}.`,
             `Step 6: Conclusion — ${staticExplanation}`,
@@ -461,7 +521,7 @@ export function analyzeCode(code: string): AnalysisResult {
 
     // 2. Determine sample sizes based on code features
     let sampleSizes = [10, 50, 100, 250, 500, 750, 1000];
-    if (features.maxNestingDepth >= 2) {
+    if (features.maxNesting >= 2) {
         sampleSizes = [10, 25, 50, 100, 200, 350, 500];
     }
     if (features.hasRecursion && !features.hasDivideConquer) {
@@ -530,7 +590,7 @@ export function analyzeCode(code: string): AnalysisResult {
 
     // 9. Hardware estimation
     let hardwareCost = 'Cache-friendly — sequential access pattern';
-    if (features.maxNestingDepth >= 2) {
+    if (features.maxNesting >= 2) {
         hardwareCost = 'Potential cache thrashing — nested iteration over large data';
     }
     if (features.hasRecursion) {
@@ -566,7 +626,7 @@ export function analyzeCode(code: string): AnalysisResult {
     let parallelFraction = 0.0;
     if (features.loopCount > 0 && !features.hasRecursion) parallelFraction = 0.85;
     else if (features.hasDivideConquer) parallelFraction = 0.70;
-    else if (features.maxNestingDepth >= 2) parallelFraction = 0.90;
+    else if (features.maxNesting >= 2) parallelFraction = 0.90;
     const cores = 8;
     const speedup = parallelFraction > 0 ? 1 / ((1 - parallelFraction) + parallelFraction / cores) : 1.0;
     const parallelSpeedupRatio = `${speedup.toFixed(1)}x on ${cores} cores (${(parallelFraction * 100).toFixed(0)}% parallelizable)`;
