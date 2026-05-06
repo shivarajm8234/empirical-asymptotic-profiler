@@ -1,24 +1,77 @@
 /**
  * Sandbox Runner — Executes user code safely in an isolated VM context.
  *
- * Uses Node.js `vm` module with strict timeouts to prevent infinite loops,
- * memory leaks, or malicious code from crashing the extension host.
+ * Uses Node.js `vm` module with strict timeouts. Strips imports, exports,
+ * and type annotations to handle TypeScript and ES module code. For non-JS
+ * languages (Java, Python, C), signals the caller to fall back to static analysis.
  */
 import * as vm from 'vm';
 
 export interface SandboxResult {
     durationMs: number;
-    memoryDeltaBytes: number;
     error: string | null;
 }
 
 /**
+ * Strip import/export statements, TypeScript type annotations, and decorators
+ * so the vm module can actually parse and run the code.
+ */
+function sanitizeForVM(code: string): string {
+    let cleaned = code;
+
+    // Remove import statements (ES modules and CommonJS require)
+    cleaned = cleaned.replace(/^\s*import\s+.*?[;\n]/gm, '');
+    cleaned = cleaned.replace(/^\s*const\s+.*?=\s*require\s*\(.*?\)\s*;?/gm, '');
+
+    // Remove export keywords (keep the declarations)
+    cleaned = cleaned.replace(/^\s*export\s+(default\s+)?/gm, '');
+
+    // Remove TypeScript type annotations from parameters: (x: number, y: string) -> (x, y)
+    cleaned = cleaned.replace(/(\w+)\s*:\s*(?:number|string|boolean|any|void|never|object|unknown|null|undefined)(\s*\[\s*\])?/g, '$1');
+
+    // Remove TypeScript return type annotations: ): number { -> ) {
+    cleaned = cleaned.replace(/\)\s*:\s*(?:number|string|boolean|any|void|never|object|unknown|null|undefined)(\s*\[\s*\])?\s*\{/g, ') {');
+    cleaned = cleaned.replace(/\)\s*:\s*(?:number|string|boolean|any|void|never|object|unknown|null|undefined)(\s*\[\s*\])?\s*=>/g, ') =>');
+
+    // Remove interface/type declarations
+    cleaned = cleaned.replace(/^\s*(?:interface|type)\s+\w+[\s\S]*?\n\}/gm, '');
+
+    // Remove generic type parameters: Array<number> -> Array, Map<string, number> -> Map
+    cleaned = cleaned.replace(/<(?:number|string|boolean|any|void|object|unknown|null|undefined)(?:\s*\[\s*\])?(?:\s*,\s*(?:number|string|boolean|any|void|object|unknown|null|undefined)(?:\s*\[\s*\])?)*>/g, '');
+
+    // Remove `as` type assertions
+    cleaned = cleaned.replace(/\s+as\s+\w+/g, '');
+
+    // Remove access modifiers (public, private, protected, readonly)
+    cleaned = cleaned.replace(/\b(public|private|protected|readonly)\s+/g, '');
+
+    return cleaned;
+}
+
+/**
+ * Check if code is a language that the Node.js VM can potentially execute.
+ */
+export function isExecutableLanguage(code: string): boolean {
+    // Java
+    if (/public\s+static\s+void\s+main|System\.out\.println|class\s+\w+\s*\{/.test(code) &&
+        /\b(int|String|void|boolean|float|double|long)\b/.test(code)) {
+        return false;
+    }
+    // Python
+    if (/def\s+\w+\s*\(/.test(code) && !/(function|=>|const|let|var)/.test(code)) {
+        return false;
+    }
+    // C/C++
+    if (/#include|printf|scanf|int\s+main\s*\(/.test(code)) {
+        return false;
+    }
+    return true;
+}
+
+/**
  * Generate appropriate input data for a given size N.
- * Analyzes code to infer what kind of input the function expects.
  */
 export function generateInput(code: string, n: number): any[] {
-    const lowerCode = code.toLowerCase();
-
     // Detect if function takes a string
     if (/:\s*string|param.*string|str\s*[,)]/i.test(code)) {
         const chars = 'abcdefghijklmnopqrstuvwxyz';
@@ -38,7 +91,7 @@ export function generateInput(code: string, n: number): any[] {
     }
 
     // Detect if function takes a single number (e.g., fibonacci(n))
-    if (/\(\s*n\s*\)|\(\s*n\s*:/.test(code) && !/arr|list|array/i.test(code)) {
+    if (/\(\s*n\s*\)|\(\s*n\s*:|\(\s*n\s*,/.test(code) && !/arr|list|array/i.test(code)) {
         return [n];
     }
 
@@ -55,8 +108,8 @@ export function generateInput(code: string, n: number): any[] {
 }
 
 /**
- * Execute a JS function in a sandboxed VM context and measure time + memory.
- * Returns -1 for duration on error. Enforces a hard timeout.
+ * Execute a JS/TS function in a sandboxed VM context and measure time.
+ * Returns durationMs = -1 on error.
  */
 export function runInSandbox(
     code: string,
@@ -64,12 +117,11 @@ export function runInSandbox(
     args: any[],
     timeoutMs: number = 2000
 ): SandboxResult {
-    // Build a sandbox with performance API, Math, console, and Array
+    const sanitized = sanitizeForVM(code);
+
     const sandbox: Record<string, any> = {
         __args: args,
         __durationMs: 0,
-        __memBefore: 0,
-        __memAfter: 0,
         Array,
         Math,
         parseInt,
@@ -79,13 +131,22 @@ export function runInSandbox(
         Boolean,
         Object,
         JSON,
-        console: { log: () => {}, error: () => {}, warn: () => {} }, // Silence console
+        Map,
+        Set,
+        Date,
+        RegExp,
+        Error,
+        Infinity,
+        NaN,
+        undefined,
+        isNaN,
+        isFinite,
+        console: { log: () => {}, error: () => {}, warn: () => {} },
         performance: { now: () => performance.now() },
     };
 
-    // Build the script: define the function, warm up, then measure
     const scriptCode = `
-        ${code}
+        ${sanitized}
 
         // Warmup: run 3 times to let V8 optimize
         for (let __w = 0; __w < 3; __w++) {
@@ -106,27 +167,20 @@ export function runInSandbox(
 
         return {
             durationMs: sandbox.__durationMs,
-            memoryDeltaBytes: 0, // vm context doesn't expose memory; we approximate elsewhere
             error: null,
         };
     } catch (err: any) {
         const message = err?.message || String(err);
-        // Differentiate timeout vs other errors
         if (message.includes('Script execution timed out')) {
-            return { durationMs: -1, memoryDeltaBytes: 0, error: `Timeout after ${timeoutMs}ms` };
+            return { durationMs: -1, error: `Timeout after ${timeoutMs}ms` };
         }
-        return { durationMs: -1, memoryDeltaBytes: 0, error: message };
+        return { durationMs: -1, error: message };
     }
 }
 
 /**
  * Run a full benchmark suite for a function across multiple input sizes.
  * Returns (N, medianTime) pairs suitable for regression.
- *
- * @param code         The raw source code containing the function
- * @param functionName The name of the function to benchmark
- * @param sizes        Array of input sizes to test
- * @param iterations   Number of runs per size (for median calculation)
  */
 export function benchmarkFunction(
     code: string,
@@ -136,6 +190,12 @@ export function benchmarkFunction(
 ): { data: { n: number; time: number }[]; errors: string[] } {
     const data: { n: number; time: number }[] = [];
     const errors: string[] = [];
+
+    // Early exit if code is not executable in Node.js
+    if (!isExecutableLanguage(code)) {
+        errors.push('Non-JavaScript language detected. Using structural analysis instead of runtime profiling.');
+        return { data, errors };
+    }
 
     for (const n of sizes) {
         const args = generateInput(code, n);
@@ -147,7 +207,7 @@ export function benchmarkFunction(
                 if (!errors.includes(result.error)) {
                     errors.push(`N=${n}: ${result.error}`);
                 }
-                break; // Don't keep retrying if there's an error at this size
+                break;
             }
             if (result.durationMs >= 0) {
                 timings.push(result.durationMs);
@@ -155,7 +215,6 @@ export function benchmarkFunction(
         }
 
         if (timings.length >= 3) {
-            // Trim outliers: remove top and bottom values
             timings.sort((a, b) => a - b);
             const trimmed = timings.slice(1, -1);
             const median = trimmed[Math.floor(trimmed.length / 2)];

@@ -22,7 +22,6 @@ export function activate(context: vscode.ExtensionContext) {
 			title: "EAP: Profiling complexity...",
 			cancellable: false
 		}, async () => {
-			// Run analysis (may take a few seconds due to benchmarking)
 			const result = analyzeCode(code);
 			showResultWebview(context, result);
 		});
@@ -34,7 +33,7 @@ export function activate(context: vscode.ExtensionContext) {
 function showResultWebview(context: vscode.ExtensionContext, result: AnalysisResult) {
 	const panel = vscode.window.createWebviewPanel(
 		'eapResult',
-		`EAP: ${result.functionName} → ${result.timeComplexity}`,
+		`EAP: ${result.functionName} -> ${result.timeComplexity}`,
 		vscode.ViewColumn.Beside,
 		{ enableScripts: true }
 	);
@@ -45,16 +44,17 @@ function showResultWebview(context: vscode.ExtensionContext, result: AnalysisRes
 function getWebviewContent(result: AnalysisResult) {
 	const confidencePercent = (result.confidence * 100).toFixed(1);
 	const gradeColors: Record<string, string> = {
-		'S': '#00e676', 'A': '#76ff03', 'C': '#ffc107', 'D': '#ff5722', 'F': '#f44336',
+		'S': '#00e676', 'A': '#76ff03', 'B': '#8bc34a', 'C': '#ffc107', 'D': '#ff5722', 'F': '#f44336',
 	};
 	const gradeColor = gradeColors[result.grade] || '#ccc';
+	const modeLabel = result.analysisMode === 'empirical' ? 'Empirical (runtime profiling)' : 'Structural (static analysis)';
 
 	const modelComparisonRows = result.allModels
 		.map(m => {
 			const isBest = m.bigO === result.timeComplexity;
 			const r2Color = m.r2 > 0.9 ? '#00e676' : m.r2 > 0.7 ? '#ffc107' : '#f44336';
 			return `<tr style="${isBest ? 'background: rgba(0,122,204,0.15);' : ''}">
-				<td>${isBest ? '✓ ' : ''}${m.name}</td>
+				<td>${isBest ? '> ' : ''}${m.name}</td>
 				<td><code>${m.bigO}</code></td>
 				<td style="color: ${r2Color}">${m.r2.toFixed(4)}</td>
 				<td style="font-size:0.85em;opacity:0.8">${m.formula}</td>
@@ -63,10 +63,23 @@ function getWebviewContent(result: AnalysisResult) {
 
 	const warningBlock = result.warnings.length > 0
 		? `<div class="card warning-card">
-			<h2>⚠️ Warnings</h2>
+			<h2>Warnings</h2>
 			<ul>${result.warnings.map(w => `<li>${w}</li>`).join('')}</ul>
 		</div>`
 		: '';
+
+	const chartBlock = result.empiricalData.length > 0
+		? `<div class="card">
+			<h2>Empirical Growth Curve</h2>
+			<p style="margin:0 0 6px;font-size:0.9em;opacity:0.8"><strong>Best fit:</strong> ${result.regressionFormula}</p>
+			<div class="chart-container">
+				<canvas id="chart"></canvas>
+			</div>
+		</div>`
+		: `<div class="card">
+			<h2>Empirical Growth Curve</h2>
+			<p style="opacity:0.7">No runtime data available. Analysis was performed using structural pattern matching.</p>
+		</div>`;
 
 	return `
 <!DOCTYPE html>
@@ -105,6 +118,7 @@ function getWebviewContent(result: AnalysisResult) {
 			border-radius: 8px;
 			color: #000;
 			background: ${gradeColor};
+			flex-shrink: 0;
 		}
 		.big-o {
 			font-size: 2.2em;
@@ -116,6 +130,16 @@ function getWebviewContent(result: AnalysisResult) {
 			font-size: 0.9em;
 			opacity: 0.7;
 		}
+		.mode-badge {
+			display: inline-block;
+			padding: 2px 8px;
+			border-radius: 3px;
+			font-size: 0.8em;
+			font-weight: 600;
+			background: ${result.analysisMode === 'empirical' ? 'rgba(0,230,118,0.15)' : 'rgba(255,193,7,0.15)'};
+			color: ${result.analysisMode === 'empirical' ? '#00e676' : '#ffc107'};
+			border: 1px solid ${result.analysisMode === 'empirical' ? 'rgba(0,230,118,0.3)' : 'rgba(255,193,7,0.3)'};
+		}
 		.card {
 			background-color: var(--vscode-editorWidget-background);
 			border: 1px solid var(--vscode-widget-border);
@@ -125,6 +149,7 @@ function getWebviewContent(result: AnalysisResult) {
 		}
 		.warning-card {
 			border-color: #ffc107;
+			border-width: 2px;
 		}
 		.card h2 {
 			margin: 0 0 12px 0;
@@ -198,23 +223,18 @@ function getWebviewContent(result: AnalysisResult) {
 			<h1>Empirical Asymptotic Profiler</h1>
 			<div><span class="big-o">${result.timeComplexity}</span></div>
 			<div class="subtitle">
-				${result.functionName}() · ${result.language} · ${confidencePercent}% confidence · ${result.analysisTimeMs.toFixed(0)}ms analysis
+				${result.functionName}() &middot; ${result.language} &middot; ${confidencePercent}% confidence &middot; ${result.analysisTimeMs.toFixed(0)}ms
+				&middot; <span class="mode-badge">${modeLabel}</span>
 			</div>
 		</div>
 	</div>
 
 	${warningBlock}
 
-	<div class="card">
-		<h2>📈 Empirical Growth Curve</h2>
-		<p style="margin:0 0 6px;font-size:0.9em;opacity:0.8"><strong>Best fit:</strong> ${result.regressionFormula}</p>
-		<div class="chart-container">
-			<canvas id="chart"></canvas>
-		</div>
-	</div>
+	${chartBlock}
 
 	<div class="card">
-		<h2>📊 Model Comparison</h2>
+		<h2>Model Comparison</h2>
 		<table>
 			<thead><tr><th>Model</th><th>Big-O</th><th>R²</th><th>Formula</th></tr></thead>
 			<tbody>${modelComparisonRows}</tbody>
@@ -222,7 +242,7 @@ function getWebviewContent(result: AnalysisResult) {
 	</div>
 
 	<div class="card">
-		<h2>🧮 Core Complexity Profile</h2>
+		<h2>Core Complexity Profile</h2>
 		<div class="metric">
 			<span class="metric-label">Time Complexity</span>
 			<span class="metric-value">${result.timeComplexity}</span>
@@ -242,7 +262,7 @@ function getWebviewContent(result: AnalysisResult) {
 	</div>
 
 	<div class="card">
-		<h2>⚔️ Adversarial Analysis</h2>
+		<h2>Adversarial Analysis</h2>
 		<div class="metric">
 			<span class="metric-label">Vulnerability Level</span>
 			<span class="metric-value">${result.adversarialVulnerability}</span>
@@ -260,7 +280,7 @@ function getWebviewContent(result: AnalysisResult) {
 	</div>
 
 	<div class="card">
-		<h2>🔬 Algorithmic Intelligence</h2>
+		<h2>Algorithmic Intelligence</h2>
 		<div class="metric">
 			<span class="metric-label">Fingerprint</span>
 			<span class="metric-value">${result.complexityFingerprint}</span>
@@ -280,7 +300,7 @@ function getWebviewContent(result: AnalysisResult) {
 	</div>
 
 	<div class="card">
-		<h2>🎯 Input Intelligence</h2>
+		<h2>Input Intelligence</h2>
 		<div class="metric">
 			<span class="metric-label">Inferred Input Shape</span>
 			<span class="metric-value">${result.inferredInputShape}</span>
@@ -292,7 +312,7 @@ function getWebviewContent(result: AnalysisResult) {
 	</div>
 
 	<div class="card">
-		<h2>🎓 Classroom Mode</h2>
+		<h2>Classroom Mode</h2>
 		<p><strong>Plain English:</strong> ${result.naturalLanguageExplanation}</p>
 		<p><strong>Step-by-step derivation:</strong></p>
 		<ul>
@@ -301,27 +321,26 @@ function getWebviewContent(result: AnalysisResult) {
 	</div>
 
 	<div class="card">
-		<h2>🧪 Pop Quiz</h2>
+		<h2>Pop Quiz</h2>
 		<p><strong>${result.quizQuestion.question}</strong></p>
 		<ul>
 			${result.quizQuestion.options.map((o, i) => `<li>${String.fromCharCode(65 + i)}) ${o}</li>`).join('')}
 		</ul>
 		<button class="quiz-btn" onclick="document.getElementById('quiz-answer').style.display='block'">Show Answer</button>
 		<div id="quiz-answer" class="quiz-answer">
-			✅ <strong>${result.quizQuestion.answer}</strong>
+			Answer: <strong>${result.quizQuestion.answer}</strong>
 		</div>
 	</div>
 
 	<div class="card">
-		<h2>📋 Certificate</h2>
+		<h2>Certificate</h2>
 		<p style="font-family:var(--vscode-editor-font-family);font-size:0.95em">${result.complexityCertificate}</p>
 	</div>
 
+	${result.empiricalData.length > 0 ? `
 	<script>
 		const ctx = document.getElementById('chart').getContext('2d');
 		const empiricalData = ${JSON.stringify(result.empiricalData)};
-		const N = empiricalData.map(d => d.n);
-		const times = empiricalData.map(d => d.time);
 
 		new Chart(ctx, {
 			type: 'scatter',
@@ -370,6 +389,7 @@ function getWebviewContent(result: AnalysisResult) {
 			}
 		});
 	</script>
+	` : ''}
 </body>
 </html>`;
 }
