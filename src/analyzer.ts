@@ -92,56 +92,50 @@ interface CodeFeatures {
  */
 function computeNestingDepth(code: string): number {
     const lines = code.split('\n');
-    let maxDepth = 0;
+    let maxNesting = 0;
     
-    // Tier 1: Brace-based nesting (C-style)
-    let currentBraceDepth = 0;
-    let maxBraceNesting = 0;
     const loopKeywords = /\b(for|while|do|foreach|map|forEach)\b/;
-
-    // Tier 2: Indentation-based nesting (Python-style)
-    const indentDepths: number[] = [];
-    let maxIndentNesting = 0;
+    
+    // Brace-based state
+    let braceDepth = 0;
+    
+    // Indentation-based state (Stack of indentation levels)
+    const indentStack: number[] = [0];
+    let indentNesting = 0;
 
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) continue;
 
-        const isLoopStart = loopKeywords.test(trimmed);
+        const indent = line.match(/^(\s*)/)?.[1].length || 0;
+        const isLoop = loopKeywords.test(trimmed);
+
+        // Update Indentation Stack
+        while (indentStack.length > 1 && indent <= indentStack[indentStack.length - 1]) {
+            indentStack.pop();
+        }
         
-        // Brace logic
-        if (isLoopStart) {
-            currentBraceDepth++;
-            if (currentBraceDepth > maxBraceNesting) maxBraceNesting = currentBraceDepth;
+        if (isLoop) {
+            indentStack.push(indent);
+            if (indentStack.length - 1 > indentNesting) {
+                indentNesting = indentStack.length - 1;
+            }
+        }
+
+        // Update Brace Depth
+        if (isLoop) {
+            braceDepth++;
         }
         if (trimmed.includes('}')) {
-            currentBraceDepth = Math.max(0, currentBraceDepth - 1);
+            braceDepth = Math.max(0, braceDepth - 1);
         }
 
-        // Indentation logic
-        const indentMatch = line.match(/^(\s*)/);
-        const currentIndent = indentMatch ? indentMatch[1].length : 0;
-        
-        if (isLoopStart) {
-            // Track nesting levels by recording indentation of loop starts
-            let nesting = 1;
-            for (let j = i - 1; j >= 0; j--) {
-                const prevLine = lines[j];
-                const prevTrimmed = prevLine.trim();
-                if (!prevTrimmed) continue;
-                
-                const prevIndent = prevLine.match(/^(\s*)/)?.[1].length || 0;
-                if (prevIndent < currentIndent && loopKeywords.test(prevTrimmed)) {
-                    nesting++;
-                }
-                if (prevIndent === 0) break;
-            }
-            if (nesting > maxIndentNesting) maxIndentNesting = nesting;
-        }
+        const currentNesting = Math.max(braceDepth, indentNesting);
+        if (currentNesting > maxNesting) maxNesting = currentNesting;
     }
 
-    return Math.max(maxBraceNesting, maxIndentNesting);
+    return maxNesting;
 }
 
 function detectFeatures(code: string): CodeFeatures {
@@ -200,77 +194,74 @@ function detectFeatures(code: string): CodeFeatures {
     };
 }
 
-// ─── Static Complexity Inference (Fallback) ─────────────────────────────────────
-
 /**
- * When sandbox execution fails, we infer complexity from structural code patterns.
- * Uses detected nesting depth, recursion patterns, and algorithm signatures.
+ * Library of known patterns and their typical complexity signatures.
+ * This prevents hardcoding in the main logic flow.
  */
+const DOMAIN_COMPLEXITY_MAP = [
+    { pattern: /\.fit\(|\.train\(|SGD|GradientDescent|Adam\(/i, bigO: 'O(epochs * n * d)', confidence: 0.82, reason: 'ML training detected' },
+    { pattern: /\.predict\(|ForwardPass/i, bigO: 'O(n * d)', confidence: 0.88, reason: 'ML inference detected' },
+    { pattern: /matmul|dot\s*\(|\.dot\(|@\s*[a-zA-Z]/i, bigO: 'O(n^3)', confidence: 0.90, reason: 'Matrix multiplication detected' },
+    { pattern: /sha256|keccak|blockchain|ProofOfWork|mineBlock/i, bigO: 'O(2^d)', confidence: 0.75, reason: 'Cryptographic hashing / Proof of Work detected' },
+    { pattern: /Conv2D|MaxPooling|Flatten\(/i, bigO: 'O(w * h * c * k)', confidence: 0.85, reason: 'CNN operations detected' },
+    { pattern: /Sparse|CSR|COO/i, bigO: 'O(nnz)', confidence: 0.80, reason: 'Sparse matrix operations detected' },
+];
+
 function inferComplexityStatically(features: CodeFeatures, code: string): {
     bigO: string;
     confidence: number;
     explanation: string;
 } {
-    // Priority 1: AI / Data Science / Blockchain / Heavy Math (Domain Specific)
-    if (/\.fit\(|\.train\(|SGD|GradientDescent|KMeans|RandomForest/i.test(code)) {
-        return { bigO: 'O(epochs * n * d)', confidence: 0.80, explanation: 'Detected ML training pattern — complexity depends on epochs, samples, and features.' };
-    }
-    if (/\.predict\(|ForwardPass/i.test(code)) {
-        return { bigO: 'O(n * d)', confidence: 0.85, explanation: 'Detected ML inference pattern — linear with respect to input features.' };
-    }
-    if (/matmul|dot\s*\(|\.dot\(|@\s*[a-zA-Z]/i.test(code)) {
-        return { bigO: 'O(n^3)', confidence: 0.88, explanation: 'Matrix multiplication detected — standard algorithms are O(n^3) or O(n^2.8).' };
-    }
-    if (/sha256|keccak|blockchain|ProofOfWork|mineBlock/i.test(code)) {
-        return { bigO: 'O(2^d)', confidence: 0.70, explanation: 'Cryptographic hashing or PoW detected — exponential with respect to difficulty/bits.' };
+    // 1. Domain-Specific Pattern Matching (from map)
+    for (const entry of DOMAIN_COMPLEXITY_MAP) {
+        if (entry.pattern.test(code)) {
+            return { bigO: entry.bigO, confidence: entry.confidence, explanation: `${entry.reason} — using domain-specific signature.` };
+        }
     }
 
-    // Priority 2: Known algorithm patterns (most accurate)
+    // 2. Multi-Parameter Detection
+    const args = features.rawArgs.split(',').map(a => a.trim()).filter(a => a && !a.includes(':'));
+    const relevantArgs = args.filter(a => new RegExp(`\\b${a}\\b`).test(code));
+    
+    // 3. Loop Body Logic Analysis (Detection of halving/logarithmic patterns)
+    const hasHalving = /\/=\s*2|>>=\s*1|floor\(.+\/2\)|range\(.+,.+,.+\*2\)/i.test(code);
+    const loopTime = hasHalving ? 'log n' : 'n';
+
+    // 4. Algorithm Signature Matching
     if (features.hasSorting && !features.hasRecursion) {
-        return { bigO: 'O(n log n)', confidence: 0.90, explanation: 'Detected sorting call — standard comparison sorts are O(n log n).' };
+        return { bigO: 'O(n log n)', confidence: 0.92, explanation: 'Standard comparison sort signature detected.' };
     }
-    if (features.hasBinarySearch && !features.hasRecursion) {
-        return { bigO: 'O(log n)', confidence: 0.85, explanation: 'Binary search pattern detected (lo/hi convergence loop).' };
+    if (features.hasBinarySearch || (features.loopCount > 0 && hasHalving)) {
+        return { bigO: 'O(log n)', confidence: 0.88, explanation: 'Logarithmic search/iteration pattern detected (halving logic).' };
     }
     if (features.hasDivideConquer) {
-        if (/merge/i.test(code)) {
-            return { bigO: 'O(n log n)', confidence: 0.88, explanation: 'Merge sort pattern detected — recursive divide with linear merge.' };
-        }
-        return { bigO: 'O(n log n)', confidence: 0.80, explanation: 'Divide and conquer recursion with halving detected.' };
+        return { bigO: 'O(n log n)', confidence: 0.85, explanation: 'Divide & Conquer recursion detected (halving with linear merge/partition).' };
     }
 
-    // Priority 2: Recursion analysis
+    // 5. Recursive Complexity
     if (features.hasRecursion) {
-        const funcCallCount = (code.match(new RegExp(`\\b${features.functionName}\\s*\\(`, 'g')) || []).length;
-        if (funcCallCount >= 3) {
-            return { bigO: 'O(2^n)', confidence: 0.75, explanation: `Multiple recursive calls to ${features.functionName}() detected — branching recursion grows exponentially.` };
-        }
-        if (features.hasBinarySearch) {
-            return { bigO: 'O(log n)', confidence: 0.82, explanation: 'Single recursive call with halving — logarithmic depth.' };
-        }
-        return { bigO: 'O(n)', confidence: 0.70, explanation: 'Single linear recursion detected — depth proportional to input.' };
+        const bodyWithoutDecl = code.substring(code.indexOf('{') > -1 ? code.indexOf('{') : 0);
+        const calls = (bodyWithoutDecl.match(new RegExp(`\\b${features.functionName}\\s*\\(`, 'g')) || []).length;
+        if (calls >= 2) return { bigO: 'O(2^n)', confidence: 0.78, explanation: 'Multiple branching recursion detected (Exponential growth).' };
+        return { bigO: `O(${loopTime})`, confidence: 0.70, explanation: `Linear/Logarithmic recursion depth detected.` };
     }
 
-    // Priority 3: Loop nesting depth
+    // 6. Structural Loop Nesting
     if (features.maxNestingDepth >= 3) {
-        return { bigO: 'O(n^3)', confidence: 0.78, explanation: `Triple-nested loop structure detected (depth=${features.maxNestingDepth}).` };
+        return { bigO: 'O(n^3)', confidence: 0.80, explanation: `Triple-nested loop structure (Nesting Depth: ${features.maxNestingDepth}).` };
     }
     if (features.maxNestingDepth === 2) {
-        return { bigO: 'O(n^2)', confidence: 0.82, explanation: 'Double-nested loop detected — quadratic iteration over input.' };
+        // Check if it's O(n*m)
+        if (relevantArgs.length >= 2) {
+            return { bigO: `O(${relevantArgs[0]} * ${relevantArgs[1]})`, confidence: 0.85, explanation: 'Nested iteration over multiple input parameters.' };
+        }
+        return { bigO: 'O(n^2)', confidence: 0.85, explanation: 'Double-nested loop detected (Quadratic scaling).' };
     }
     if (features.maxNestingDepth === 1 || features.loopCount > 0) {
-        if (/\/\s*2|>>\s*1|Math\.floor\s*\(.+\/\s*2\)/.test(code)) {
-            return { bigO: 'O(log n)', confidence: 0.75, explanation: 'Loop with halving detected — logarithmic iteration.' };
-        }
-        return { bigO: 'O(n)', confidence: 0.85, explanation: 'Single loop iterating over input — linear scan.' };
+        return { bigO: `O(${loopTime})`, confidence: 0.90, explanation: `Single level iteration detected (${loopTime} scaling).` };
     }
 
-    // Priority 4: No loops, no recursion
-    if (features.loopCount === 0 && !features.hasRecursion) {
-        return { bigO: 'O(1)', confidence: 0.92, explanation: 'No loops or recursion detected — constant time operations only.' };
-    }
-
-    return { bigO: 'O(n)', confidence: 0.50, explanation: 'Unable to determine precise complexity — defaulting to linear.' };
+    return { bigO: 'O(1)', confidence: 0.95, explanation: 'No loops or recursion detected (Constant time).' };
 }
 
 // ─── Theoretical Curve Generator ────────────────────────────────────────────────
