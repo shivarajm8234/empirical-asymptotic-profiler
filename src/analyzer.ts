@@ -87,42 +87,61 @@ interface CodeFeatures {
 }
 
 /**
- * Compute the maximum loop nesting depth by tracking brace-delimited scopes.
- * This is far more accurate than the old regex approach which only detected
- * immediately adjacent for/while keywords.
+ * Compute the maximum loop nesting depth by tracking both brace-delimited scopes
+ * and indentation-based scopes (for Python).
  */
 function computeNestingDepth(code: string): number {
-    let maxDepth = 0;
-    let currentDepth = 0;
-    let inLoop = false;
-    const loopStack: boolean[] = [];
-
     const lines = code.split('\n');
-    for (const line of lines) {
-        const trimmed = line.trim();
-        const isLoopStart = /^\s*(for|while|do)\s*[\(\{]/.test(trimmed) || /\b(for|while)\s*\(/.test(trimmed);
+    let maxDepth = 0;
+    
+    // Tier 1: Brace-based nesting (C-style)
+    let currentBraceDepth = 0;
+    let maxBraceNesting = 0;
+    const loopKeywords = /\b(for|while|do|foreach|map|forEach)\b/;
 
+    // Tier 2: Indentation-based nesting (Python-style)
+    const indentDepths: number[] = [];
+    let maxIndentNesting = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) continue;
+
+        const isLoopStart = loopKeywords.test(trimmed);
+        
+        // Brace logic
         if (isLoopStart) {
-            currentDepth++;
-            if (currentDepth > maxDepth) maxDepth = currentDepth;
-            loopStack.push(true);
+            currentBraceDepth++;
+            if (currentBraceDepth > maxBraceNesting) maxBraceNesting = currentBraceDepth;
+        }
+        if (trimmed.includes('}')) {
+            currentBraceDepth = Math.max(0, currentBraceDepth - 1);
         }
 
-        // Count braces to track scope
-        for (const ch of trimmed) {
-            if (ch === '{' && !isLoopStart) {
-                loopStack.push(false);
-            }
-            if (ch === '}') {
-                const wasLoop = loopStack.pop();
-                if (wasLoop) {
-                    currentDepth = Math.max(0, currentDepth - 1);
+        // Indentation logic
+        const indentMatch = line.match(/^(\s*)/);
+        const currentIndent = indentMatch ? indentMatch[1].length : 0;
+        
+        if (isLoopStart) {
+            // Track nesting levels by recording indentation of loop starts
+            let nesting = 1;
+            for (let j = i - 1; j >= 0; j--) {
+                const prevLine = lines[j];
+                const prevTrimmed = prevLine.trim();
+                if (!prevTrimmed) continue;
+                
+                const prevIndent = prevLine.match(/^(\s*)/)?.[1].length || 0;
+                if (prevIndent < currentIndent && loopKeywords.test(prevTrimmed)) {
+                    nesting++;
                 }
+                if (prevIndent === 0) break;
             }
+            if (nesting > maxIndentNesting) maxIndentNesting = nesting;
         }
     }
 
-    return maxDepth;
+    return Math.max(maxBraceNesting, maxIndentNesting);
 }
 
 function detectFeatures(code: string): CodeFeatures {
@@ -152,12 +171,13 @@ function detectFeatures(code: string): CodeFeatures {
     else if (/def\s+\w+\s*\(|print\s*\(/.test(code) && !/(function|=>|const|let|var)/.test(code)) language = 'Python';
     else if (/#include|printf|scanf|int\s+main/.test(code)) language = 'C/C++';
 
-    // Loop counting
-    const forLoops = (code.match(/\bfor\s*\(/g) || []).length;
-    const whileLoops = (code.match(/\bwhile\s*\(/g) || []).length;
-    const loopCount = forLoops + whileLoops;
+    // Loop counting — more generic to support Python and functional styles
+    const forLoops = (code.match(/\bfor\b/g) || []).length;
+    const whileLoops = (code.match(/\bwhile\b/g) || []).length;
+    const mapLoops = (code.match(/\.(map|forEach|filter|reduce)\s*\(/g) || []).length;
+    const loopCount = forLoops + whileLoops + mapLoops;
 
-    // Proper nesting depth (not regex pattern matching)
+    // Proper nesting depth (supports braces and indentation)
     const maxNestingDepth = computeNestingDepth(code);
 
     // Recursion: function calls itself (excluding the declaration line)
@@ -191,7 +211,21 @@ function inferComplexityStatically(features: CodeFeatures, code: string): {
     confidence: number;
     explanation: string;
 } {
-    // Priority 1: Known algorithm patterns (most accurate)
+    // Priority 1: AI / Data Science / Blockchain / Heavy Math (Domain Specific)
+    if (/\.fit\(|\.train\(|SGD|GradientDescent|KMeans|RandomForest/i.test(code)) {
+        return { bigO: 'O(epochs * n * d)', confidence: 0.80, explanation: 'Detected ML training pattern — complexity depends on epochs, samples, and features.' };
+    }
+    if (/\.predict\(|ForwardPass/i.test(code)) {
+        return { bigO: 'O(n * d)', confidence: 0.85, explanation: 'Detected ML inference pattern — linear with respect to input features.' };
+    }
+    if (/matmul|dot\s*\(|\.dot\(|@\s*[a-zA-Z]/i.test(code)) {
+        return { bigO: 'O(n^3)', confidence: 0.88, explanation: 'Matrix multiplication detected — standard algorithms are O(n^3) or O(n^2.8).' };
+    }
+    if (/sha256|keccak|blockchain|ProofOfWork|mineBlock/i.test(code)) {
+        return { bigO: 'O(2^d)', confidence: 0.70, explanation: 'Cryptographic hashing or PoW detected — exponential with respect to difficulty/bits.' };
+    }
+
+    // Priority 2: Known algorithm patterns (most accurate)
     if (features.hasSorting && !features.hasRecursion) {
         return { bigO: 'O(n log n)', confidence: 0.90, explanation: 'Detected sorting call — standard comparison sorts are O(n log n).' };
     }
