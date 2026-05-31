@@ -26,6 +26,13 @@ The Empirical Asymptotic Profiler (EAP) is a production-grade VS Code extension 
 - **Natural Language Explanations:** Translates complex Big-O notation into plain English summaries.
 - **Interactive Pop Quizzes:** Automatically generates multiple-choice questions based on the analyzed code to reinforce learning.
 
+## Screenshots
+
+![Screenshot 1](.resources/image.png)
+![Screenshot 2](.resources/image%20copy.png)
+![Screenshot 3](.resources/image%20copy%202.png)
+![Screenshot 4](.resources/image%20copy%203.png)
+
 ## Supported Languages
 
 | Language | Analysis Mode | Features |
