@@ -66,8 +66,8 @@ function olsRegression(
 }
 
 function formatCoeff(val: number): string {
-    if (Math.abs(val) < 0.00001) return '0';
-    if (Math.abs(val) >= 1000) return val.toExponential(2);
+    if (Math.abs(val) < 0.00001) {return '0';}
+    if (Math.abs(val) >= 1000) {return val.toExponential(2);}
     return val.toPrecision(4);
 }
 

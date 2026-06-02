@@ -10,10 +10,14 @@
  */
 import { fitModels, findComplexityBoundary, FitResult, RegressionModel } from './regression';
 import { benchmarkFunction } from './runner';
+import * as http from 'http';
 
 // ─── Result Interface ──────────────────────────────────────────────────────────
 
 export interface AnalysisResult {
+    isValid: boolean;
+    detectedLanguage: string;
+    validationError?: string;
     functionName: string;
     language: string;
     analysisMode: 'empirical' | 'structural';
@@ -85,8 +89,8 @@ const MagnitudeMap: Record<Magnitude, string> = {
     [Magnitude.LOG]: 'O(log n)',
     [Magnitude.LINEAR]: 'O(n)',
     [Magnitude.LINEARITHMIC]: 'O(n log n)',
-    [Magnitude.QUADRATIC]: 'O(n^2)',
-    [Magnitude.CUBIC]: 'O(n^3)',
+    [Magnitude.QUADRATIC]: 'O(n²)',
+    [Magnitude.CUBIC]: 'O(n³)',
     [Magnitude.EXPONENTIAL]: 'O(2^n)',
 };
 
@@ -121,55 +125,94 @@ interface CodeFeatures {
  * Compute the maximum loop nesting depth by tracking both brace-delimited scopes
  * and indentation-based scopes (for Python).
  */
-function computeNestingDepth(code: string): number {
+function computeNestingDepth(code: string, languageId: string): number {
     const lines = code.split('\n');
     let maxNesting = 0;
-    
-    const loopKeywords = /\b(for|while|do|foreach|map|forEach)\b/;
-    
-    // Brace-based state
-    let braceDepth = 0;
-    
-    // Indentation-based state (Stack of indentation levels)
-    const indentStack: number[] = [0];
-    let indentNesting = 0;
 
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) continue;
+    if (languageId === 'python') {
+        const loopIndentStack: number[] = [];
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) {continue;}
 
-        const indent = line.match(/^(\s*)/)?.[1].length || 0;
-        const isLoop = loopKeywords.test(trimmed);
+            const indent = line.match(/^(\s*)/)?.[1].length || 0;
 
-        // Update Indentation Stack
-        while (indentStack.length > 1 && indent <= indentStack[indentStack.length - 1]) {
-            indentStack.pop();
-        }
-        
-        if (isLoop) {
-            indentStack.push(indent);
-            if (indentStack.length - 1 > indentNesting) {
-                indentNesting = indentStack.length - 1;
+            while (loopIndentStack.length > 0 && loopIndentStack[loopIndentStack.length - 1] >= indent) {
+                loopIndentStack.pop();
+            }
+
+            if (/^\s*(for|while)\b/.test(line) && trimmed.endsWith(':')) {
+                loopIndentStack.push(indent);
+                if (loopIndentStack.length > maxNesting) {
+                    maxNesting = loopIndentStack.length;
+                }
             }
         }
+    } else if (languageId === 'shellscript') {
+        let currentDepth = 0;
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) {continue;}
 
-        // Update Brace Depth
-        if (isLoop) {
-            braceDepth++;
+            if (/^\s*(for|while|until)\b/i.test(trimmed)) {
+                currentDepth++;
+                if (currentDepth > maxNesting) {maxNesting = currentDepth;}
+            }
+            if (/^\s*done\b/i.test(trimmed)) {
+                currentDepth = Math.max(0, currentDepth - 1);
+            }
         }
-        if (trimmed.includes('}')) {
-            braceDepth = Math.max(0, braceDepth - 1);
-        }
+    } else if (languageId === 'bat') {
+        let currentDepth = 0;
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('::') || trimmed.startsWith('REM')) {continue;}
 
-        const currentNesting = Math.max(braceDepth, indentNesting);
-        if (currentNesting > maxNesting) maxNesting = currentNesting;
+            if (/^\s*for\b/i.test(trimmed) && trimmed.endsWith('(')) {
+                currentDepth++;
+                if (currentDepth > maxNesting) {maxNesting = currentDepth;}
+            }
+            if (trimmed === ')') {
+                currentDepth = Math.max(0, currentDepth - 1);
+            }
+        }
+    } else {
+        // C-style, Java, JS, TS, PowerShell
+        let currentLoopDepth = 0;
+        const braceStack: boolean[] = [];
+
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*')) {continue;}
+
+            const isLoopHeader = /\b(for|while|do)\b/i.test(trimmed) || /\.(forEach|map)\b/i.test(trimmed);
+
+            for (let charIdx = 0; charIdx < trimmed.length; charIdx++) {
+                const char = trimmed[charIdx];
+                if (char === '{') {
+                    if (isLoopHeader) {
+                        currentLoopDepth++;
+                        braceStack.push(true);
+                        if (currentLoopDepth > maxNesting) {
+                            maxNesting = currentLoopDepth;
+                        }
+                    } else {
+                        braceStack.push(false);
+                    }
+                } else if (char === '}') {
+                    const isLoopBrace = braceStack.pop();
+                    if (isLoopBrace) {
+                        currentLoopDepth = Math.max(0, currentLoopDepth - 1);
+                    }
+                }
+            }
+        }
     }
 
     return maxNesting;
 }
 
-function detectFeatures(code: string): CodeFeatures {
+function detectFeatures(code: string, languageId: string): CodeFeatures {
     const lines = code.split('\n');
     
     // Extract Function Metadata
@@ -177,6 +220,10 @@ function detectFeatures(code: string): CodeFeatures {
         /(?:function|async\s+function|def)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\((.*?)\)/,
         /(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*.*=>/,
         /(?:void|int|long|String|float|double)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\((.*?)\)/,
+        /^\s*(?:function\s+)?([a-zA-Z0-9_-]+)\s*\(\s*\)\s*\{/m,
+        /^\s*function\s+([a-zA-Z0-9_-]+)\s*\{/m,
+        /^\s*function\s+([a-zA-Z0-9_-]+)\s*(?:\(.*?\))?\s*\{/mi,
+        /^\s*:([a-zA-Z0-9_-]+)\b/m,
     ];
 
     let functionName = 'anonymous';
@@ -194,9 +241,26 @@ function detectFeatures(code: string): CodeFeatures {
     const relevantParams = args.filter(a => new RegExp(`\\b${a}\\b`).test(code));
 
     // Nesting & Recursion
-    const maxNesting = computeNestingDepth(code);
-    const bodyOnly = code.substring(code.indexOf('{') > -1 ? code.indexOf('{') : 0);
-    const recursionMatches = bodyOnly.match(new RegExp(`\\b${functionName}\\s*\\(`, 'g')) || [];
+    const maxNesting = computeNestingDepth(code, languageId);
+    
+    let hasRecursion = false;
+    let recursionCalls = 0;
+    if (languageId === 'shellscript' || languageId === 'powershell') {
+        const regex = new RegExp(`\\b${functionName}\\b`, 'g');
+        const matches = code.match(regex) || [];
+        recursionCalls = Math.max(0, matches.length - 1);
+        hasRecursion = recursionCalls > 0;
+    } else if (languageId === 'bat') {
+        const regex = new RegExp(`call\\s+:${functionName}\\b`, 'g');
+        const matches = code.match(regex) || [];
+        recursionCalls = matches.length;
+        hasRecursion = recursionCalls > 0;
+    } else {
+        const bodyOnly = code.substring(code.indexOf('{') > -1 ? code.indexOf('{') : 0);
+        const recursionMatches = bodyOnly.match(new RegExp(`\\b${functionName}\\s*\\(`, 'g')) || [];
+        recursionCalls = recursionMatches.length;
+        hasRecursion = recursionCalls > 0;
+    }
 
     // Basic heuristic flags (Data-driven)
     const hasAllocation = /new\s+[A-Z]|\[\]|malloc|calloc|ArrayList|HashMap/i.test(code);
@@ -204,16 +268,16 @@ function detectFeatures(code: string): CodeFeatures {
     const hasSorting = /\.sort\(|Arrays\.sort|sorted\(/i.test(code);
     const hasHashMap = /Map\s*\(|HashMap|dict\s*\(|new\s+Map/i.test(code);
     const hasBinarySearch = /mid\s*=|lo\s*<\s*hi|left\s*<\s*right|binary.?search/i.test(code);
-    const hasDivideConquer = (recursionMatches.length > 0) && (/merge|partition|pivot|mid/i.test(code));
-    const loopCount = (code.match(/\b(for|while|forEach|map)\b/g) || []).length;
+    const hasDivideConquer = (recursionCalls > 0) && (/merge|partition|pivot|mid/i.test(code));
+    const loopCount = (code.match(/\b(for|while|forEach|map|until)\b/g) || []).length;
 
     return {
         functionName,
         rawArgs,
         language: 'detected',
         lineCount: lines.length,
-        hasRecursion: recursionMatches.length > 0,
-        recursionCalls: recursionMatches.length,
+        hasRecursion,
+        recursionCalls,
         maxNesting,
         relevantParams,
         hasAllocation,
@@ -244,7 +308,7 @@ const HEURISTIC_DETECTORS: Detector[] = [
                 { reg: /\.sort\(|Arrays\.sort|sorted\(/i, mag: Magnitude.LINEARITHMIC, exp: 'Standard Sorting pattern' },
             ];
             for (const s of signatures) {
-                if (s.reg.test(code)) return { magnitude: s.mag, confidence: 0.85, explanation: s.exp };
+                if (s.reg.test(code)) {return { magnitude: s.mag, confidence: 0.85, explanation: s.exp };}
             }
             return null;
         }
@@ -252,7 +316,7 @@ const HEURISTIC_DETECTORS: Detector[] = [
     {
         name: 'LoopStructural',
         detect: (code, f) => {
-            if (f.maxNesting === 0) return null;
+            if (f.maxNesting === 0) {return null;}
             
             const hasHalving = /\/=\s*2|>>=\s*1|floor\(.+\/2\)|range\(.+,.+,.+\*2\)/i.test(code);
             
@@ -280,15 +344,37 @@ const HEURISTIC_DETECTORS: Detector[] = [
     {
         name: 'RecursionAnalysis',
         detect: (code, f) => {
-            if (!f.hasRecursion) return null;
-            if (f.recursionCalls >= 2) {
-                return { magnitude: Magnitude.EXPONENTIAL, confidence: 0.80, explanation: 'Multiple branching recursion (e.g. Fibonacci/Trees).' };
+            if (!f.hasRecursion) {return null;}
+            
+            if (f.hasDivideConquer && (f.loopCount > 0 || f.maxNesting > 0)) {
+                return {
+                    magnitude: Magnitude.LINEARITHMIC,
+                    confidence: 0.95,
+                    explanation: 'Divide-and-conquer recursion with linear work per level (O(n log n)).'
+                };
             }
-            const hasHalving = /\/2|>>1|mid/i.test(code);
+            
+            if (f.recursionCalls >= 2 && !/mid|partition|\/2/i.test(code)) {
+                return {
+                    magnitude: Magnitude.EXPONENTIAL,
+                    confidence: 0.90,
+                    explanation: 'Branching recursion without input halving (O(2^n) exponential growth).'
+                };
+            }
+
+            const hasHalving = /\/2|>>1|mid/i.test(code) || f.hasBinarySearch;
+            if (hasHalving && f.loopCount === 0) {
+                return {
+                    magnitude: Magnitude.LOG,
+                    confidence: 0.90,
+                    explanation: 'Logarithmic recursion with input size halving at each step (O(log n)).'
+                };
+            }
+
             return { 
-                magnitude: hasHalving ? Magnitude.LOG : Magnitude.LINEAR, 
-                confidence: 0.75, 
-                explanation: `Linear/Logarithmic recursion depth detected.` 
+                magnitude: Magnitude.LINEAR, 
+                confidence: 0.85, 
+                explanation: 'Linear recursion with single recursive step per level (O(n)).' 
             };
         }
     }
@@ -303,7 +389,7 @@ function inferComplexityStatically(features: CodeFeatures, code: string): {
     
     for (const detector of HEURISTIC_DETECTORS) {
         const h = detector.detect(code, features);
-        if (h) results.push(h);
+        if (h) {results.push(h);}
     }
 
     if (results.length === 0) {
@@ -360,15 +446,15 @@ function inferSpaceComplexity(code: string, features: CodeFeatures): string {
     const allocInLoop = /(?:for|while)[^}]*(?:new |push\(|append\(|\[\])/s.test(code);
 
     if (allocInLoop) {
-        if (features.maxNesting >= 2) return 'O(n^2) — Nested allocation detected';
+        if (features.maxNesting >= 2) {return 'O(n^2) — Nested allocation detected';}
         return 'O(n) — Linear allocation inside loop';
     }
     if (features.hasRecursion) {
-        if (features.hasDivideConquer) return 'O(n) — Merge buffers + O(log n) call stack';
+        if (features.hasDivideConquer) {return 'O(n) — Merge buffers + O(log n) call stack';}
         return 'O(n) — Recursion depth scales with input';
     }
-    if (features.hasHashMap) return 'O(n) — Hash map/set storage';
-    if (features.hasAllocation) return 'O(n) — Dynamic allocation detected';
+    if (features.hasHashMap) {return 'O(n) — Hash map/set storage';}
+    if (features.hasAllocation) {return 'O(n) — Dynamic allocation detected';}
     return 'O(1) — Constant auxiliary space';
 }
 
@@ -408,7 +494,7 @@ function analyzeAdversarial(features: CodeFeatures, timeBigO: string): { level: 
 // ─── Phase Transition Detection ─────────────────────────────────────────────────
 
 function detectPhaseTransitions(data: { n: number; time: number }[], bigO: string): string {
-    if (data.length < 5) return 'Not enough empirical data for phase analysis';
+    if (data.length < 5) {return 'Not enough empirical data for phase analysis';}
 
     const ratios: number[] = [];
     for (let i = 1; i < data.length; i++) {
@@ -510,16 +596,322 @@ function generateExplanation(
     return { classroom, naturalLanguage, quiz };
 }
 
+// ─── Code Validator ───────────────────────────────────────────────────────────
+
+export function validateCode(code: string, languageId: string): { isValid: boolean; detectedLanguage: string; reason?: string } {
+    const trimmed = code.trim();
+    if (!trimmed) {
+        return { isValid: false, detectedLanguage: 'unknown', reason: 'The selection is empty.' };
+    }
+
+    // Reject purely interface, type, or enum declarations, or purely imports/exports
+    const cleanNoTypes = trimmed
+        .replace(/^\s*(?:export\s+)?(?:interface|enum)\s+\w+[\s\S]*?\}/gm, '')
+        .replace(/^\s*(?:export\s+)?type\s+\w+\s*=\s*[^;\n]+;?/gm, '')
+        .replace(/^\s*import\s+.*?[;\n]/gm, '')
+        .replace(/^\s*export\s+{[^}]+};?/gm, '')
+        .trim();
+
+    if (!cleanNoTypes) {
+        return {
+            isValid: false,
+            detectedLanguage: 'unknown',
+            reason: 'The selection consists only of type/interface declarations or imports, which do not contain any runnable code logic.'
+        };
+    }
+
+    const supportedLangs = ['javascript', 'typescript', 'javascriptreact', 'typescriptreact', 'python', 'java', 'c', 'cpp', 'shellscript', 'powershell', 'bat'];
+
+    const friendlyNames: Record<string, string> = {
+        'javascript': 'JavaScript',
+        'typescript': 'TypeScript',
+        'javascriptreact': 'React JavaScript',
+        'typescriptreact': 'React TypeScript',
+        'python': 'Python',
+        'java': 'Java',
+        'c': 'C',
+        'cpp': 'C++',
+        'shellscript': 'Bash/Shell Script',
+        'powershell': 'PowerShell',
+        'bat': 'Batch Script'
+    };
+
+    let targetLang = languageId;
+
+    if (!supportedLangs.includes(targetLang)) {
+        if (/#!/i.test(trimmed)) {
+            if (/bash|sh|zsh/i.test(trimmed)) {targetLang = 'shellscript';}
+            else if (/python/i.test(trimmed)) {targetLang = 'python';}
+            else if (/pwsh|powershell/i.test(trimmed)) {targetLang = 'powershell';}
+        } else if (/def\s+\w+\s*\(/.test(trimmed) && /:/.test(trimmed)) {
+            targetLang = 'python';
+        } else if (/#include\s+<\w+>|printf\s*\(/.test(trimmed)) {
+            targetLang = 'c';
+        } else if (/public\s+class\s+\w+|System\.out\.print/.test(trimmed)) {
+            targetLang = 'java';
+        } else if (/\b(function|const|let|var)\b/.test(trimmed) && /{|=>/.test(trimmed)) {
+            targetLang = 'javascript';
+        } else if (/\$env:|\b(Get-Command|Write-Output|Get-Process|foreach-object)\b/i.test(trimmed)) {
+            targetLang = 'powershell';
+        } else if (/\b(echo|setlocal|exit\s+\/b)\b/i.test(trimmed) && /%/i.test(trimmed)) {
+            targetLang = 'bat';
+        } else if (/\b(if|for|while)\b.*do|echo\s+|done\b/s.test(trimmed)) {
+            targetLang = 'shellscript';
+        }
+    }
+
+    if (!supportedLangs.includes(targetLang)) {
+        return { 
+            isValid: false, 
+            detectedLanguage: 'unknown', 
+            reason: 'Unsupported language format. EAP supports JS, TS, Python, Java, C/C++, and OS shell scripts (Bash, PowerShell, Batch).' 
+        };
+    }
+
+    if (trimmed.length < 5) {
+        return { isValid: false, detectedLanguage: targetLang, reason: 'The selection is too short to be a valid code snippet.' };
+    }
+
+    const codeTokens = [
+        '{', '}', '(', ')', ';', '=', '+', '-', '*', '/', '[', ']',
+        'if', 'else', 'for', 'while', 'return', 'function', 'class', 'import',
+        'const', 'let', 'var', 'def', 'public', 'private', 'static', 'void', 'int', 'double', 'float', 'char', 'string',
+        'echo', 'do', 'done', 'then', 'fi', 'elif', 'set', 'local', 'Write-Host', 'Get-ChildItem', 'cmdlet'
+    ];
+
+    let tokenCount = 0;
+    for (const t of codeTokens) {
+        const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(t.length > 2 ? `\\b${escaped}\\b` : escaped, 'g');
+        const matches = trimmed.match(regex);
+        if (matches) {
+            tokenCount += matches.length;
+        }
+    }
+
+    if (tokenCount < 1) {
+        return { 
+            isValid: false, 
+            detectedLanguage: targetLang, 
+            reason: 'The selection lacks code syntax elements (operators, braces, or keywords). It may be plain text.' 
+        };
+    }
+
+    return { isValid: true, detectedLanguage: friendlyNames[targetLang] || targetLang };
+}
+
+// ─── Ollama Pop Quiz Generator ────────────────────────────────────────────────
+
+async function generatePopQuiz(
+    code: string,
+    functionName: string,
+    bigO: string
+): Promise<{ question: string; options: string[]; answer: string }> {
+    const fallbackQuiz = () => {
+        const allOptions = ['O(1)', 'O(log n)', 'O(n)', 'O(n log n)', 'O(n^2)', 'O(n^3)', 'O(2^n)'];
+        const quizOptions = [bigO, ...allOptions.filter(o => o !== bigO)].slice(0, 4);
+        quizOptions.sort();
+        return {
+            question: `What is the time complexity of "${functionName}"?`,
+            options: quizOptions,
+            answer: bigO,
+        };
+    };
+
+    return new Promise((resolve) => {
+        const reqTags = http.request({
+            hostname: 'localhost',
+            port: 11434,
+            path: '/api/tags',
+            method: 'GET',
+            timeout: 1000
+        }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    const json = JSON.parse(data);
+                    const models: any[] = json.models || [];
+                    const installedNames = models.map(m => m.name);
+                    
+                    const priorityList = [
+                        'qwen2.5-coder:3b',
+                        'deepseek-coder:1.3b',
+                        'llama3.2:1b',
+                        'phi3:mini',
+                        'gemma:2b',
+                        'deepseek-r1:1.5b',
+                        'qwen2.5:0.5b',
+                        'codegemma:2b',
+                        'phi:latest',
+                        'tinyllama:latest',
+                        'smollm:360m',
+                        'smollm:135m'
+                    ];
+
+                    let selectedModel = 'llama3.2:1b';
+                    for (const p of priorityList) {
+                        if (installedNames.includes(p)) {
+                            selectedModel = p;
+                            break;
+                        }
+                    }
+                    if (!installedNames.includes(selectedModel) && installedNames.length > 0) {
+                        selectedModel = installedNames[0];
+                    }
+
+                    const prompt = `You are a computer science professor. Generate a multiple-choice pop quiz question testing the understanding of the time complexity of the following code snippet.
+
+Code:
+\`\`\`
+${code}
+\`\`\`
+
+Detected Complexity: ${bigO}
+
+You must return ONLY a JSON object with this exact structure (no markdown code blocks, no explanation, no extra text):
+{
+  "question": "A clear conceptual question about this code's time complexity or behavior.",
+  "options": [
+    "Option A (must contain correct complexity: ${bigO})",
+    "Option B (incorrect complexity)",
+    "Option C (incorrect complexity)",
+    "Option D (incorrect complexity)"
+  ],
+  "answer": "The correct option string (must match one of the four options exactly)"
+}
+
+Ensure the options are diverse, one of the options matches the correct complexity "${bigO}" or is the correct answer, and the answer is accurate. Give the JSON object now:`;
+
+                    const requestBody = JSON.stringify({
+                        model: selectedModel,
+                        prompt: prompt,
+                        stream: false,
+                        options: {
+                            temperature: 0.3
+                        }
+                    });
+
+                    const reqGen = http.request({
+                        hostname: 'localhost',
+                        port: 11434,
+                        path: '/api/generate',
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Content-Length': Buffer.byteLength(requestBody)
+                        },
+                        timeout: 3000
+                    }, (resGen) => {
+                        let genData = '';
+                        resGen.on('data', chunk => genData += chunk);
+                        resGen.on('end', () => {
+                            try {
+                                const genJson = JSON.parse(genData);
+                                let text = genJson.response || '';
+                                text = text.trim();
+                                if (text.startsWith('```')) {
+                                    text = text.replace(/^```(?:json)?\s*/i, '');
+                                    text = text.replace(/\s*```$/i, '');
+                                }
+                                const quizData = JSON.parse(text.trim());
+                                if (quizData.question && Array.isArray(quizData.options) && quizData.answer) {
+                                    resolve({
+                                        question: quizData.question,
+                                        options: quizData.options,
+                                        answer: quizData.answer
+                                    });
+                                } else {
+                                    resolve(fallbackQuiz());
+                                }
+                            } catch (e) {
+                                resolve(fallbackQuiz());
+                            }
+                        });
+                    });
+
+                    reqGen.on('error', () => resolve(fallbackQuiz()));
+                    reqGen.on('timeout', () => {
+                        reqGen.destroy();
+                        resolve(fallbackQuiz());
+                    });
+                    reqGen.write(requestBody);
+                    reqGen.end();
+                } catch (e) {
+                    resolve(fallbackQuiz());
+                }
+            });
+        });
+
+        reqTags.on('error', () => resolve(fallbackQuiz()));
+        reqTags.on('timeout', () => {
+            reqTags.destroy();
+            resolve(fallbackQuiz());
+        });
+        reqTags.end();
+    });
+}
+
+function getMagnitude(bigO: string): Magnitude {
+    const clean = bigO.replace('²', '^2').replace('³', '^3');
+    if (clean.includes('2^n')) {return Magnitude.EXPONENTIAL;}
+    if (clean.includes('n^3')) {return Magnitude.CUBIC;}
+    if (clean.includes('n^2')) {return Magnitude.QUADRATIC;}
+    if (clean.includes('n log n')) {return Magnitude.LINEARITHMIC;}
+    if (clean.includes('log n')) {return Magnitude.LOG;}
+    if (clean.includes('n')) {return Magnitude.LINEAR;}
+    return Magnitude.CONSTANT;
+}
+
 // ─── Main Analysis Function ─────────────────────────────────────────────────────
 
-export function analyzeCode(code: string): AnalysisResult {
+export async function analyzeCode(code: string, languageId: string): Promise<AnalysisResult> {
     const startTime = performance.now();
     const warnings: string[] = [];
 
-    // 1. Detect code features
-    const features = detectFeatures(code);
+    // 1. Validate Code
+    const validation = validateCode(code, languageId);
+    if (!validation.isValid) {
+        return {
+            isValid: false,
+            detectedLanguage: validation.detectedLanguage,
+            validationError: validation.reason,
+            functionName: 'N/A',
+            language: 'N/A',
+            analysisMode: 'structural',
+            timeComplexity: 'O(?)',
+            spaceComplexity: 'O(?)',
+            confidence: 0,
+            regressionFormula: 'N/A',
+            allModels: [],
+            phaseTransitions: 'N/A',
+            adversarialVulnerability: 'N/A',
+            adversarialDetail: 'N/A',
+            amortizedCost: 'N/A',
+            hardwareCost: 'N/A',
+            expectedComplexity: null,
+            complexityFingerprint: 'N/A',
+            recursiveCallTree: 'N/A',
+            parallelSpeedupRatio: 'N/A',
+            inferredInputShape: 'N/A',
+            complexityBoundary: 'N/A',
+            complexityCertificate: 'N/A',
+            grade: 'F',
+            classroomExplanation: [],
+            naturalLanguageExplanation: 'Selection is invalid or not suitable for analysis.',
+            quizQuestion: { question: 'N/A', options: [], answer: 'N/A' },
+            empiricalData: [],
+            analysisTimeMs: performance.now() - startTime,
+            sampleSizes: [],
+            warnings: [validation.reason || 'Invalid selection.'],
+        };
+    }
 
-    // 2. Determine sample sizes based on code features
+    // 2. Detect code features
+    const features = detectFeatures(code, languageId);
+    features.language = validation.detectedLanguage;
+
+    // 3. Determine sample sizes based on code features
     let sampleSizes = [10, 50, 100, 250, 500, 750, 1000];
     if (features.maxNesting >= 2) {
         sampleSizes = [10, 25, 50, 100, 200, 350, 500];
@@ -528,13 +920,10 @@ export function analyzeCode(code: string): AnalysisResult {
         sampleSizes = [5, 10, 15, 20, 25, 30, 35];
     }
 
-    // 3. Attempt empirical benchmarking
+    // 4. Attempt empirical benchmarking
     const benchmark = benchmarkFunction(code, features.functionName, sampleSizes);
-    if (benchmark.errors.length > 0) {
-        warnings.push(...benchmark.errors);
-    }
 
-    // 4. Decide analysis mode
+    // 5. Decide analysis mode
     let analysisMode: 'empirical' | 'structural' = 'empirical';
     let fitResult: FitResult | null = null;
     let bigO: string;
@@ -543,52 +932,64 @@ export function analyzeCode(code: string): AnalysisResult {
     let allModels: { name: string; bigO: string; r2: number; formula: string }[] = [];
     let staticExplanation = '';
 
+    const staticResult = inferComplexityStatically(features, code);
+    const structuralMag = getMagnitude(staticResult.bigO);
+
     if (benchmark.data.length >= 3) {
-        // Enough data for regression
         fitResult = fitModels(benchmark.data);
         if (fitResult.warning) {
             warnings.push(fitResult.warning);
         }
 
         const best = fitResult.best;
-        bigO = best.bigO;
-        confidence = Math.max(0, best.adjustedR2);
-        regressionFormula = best.formula;
+        const empiricalMag = getMagnitude(best.bigO);
+
+        if (structuralMag > empiricalMag) {
+            analysisMode = 'structural';
+            bigO = staticResult.bigO;
+            confidence = Math.max(0.5, staticResult.confidence);
+            regressionFormula = `Theoretical ${staticResult.bigO} (structural worst-case override; empirical was ${best.bigO})`;
+            warnings.push(`Empirical profiling indicates faster average-case growth (${best.bigO}), likely due to early returns. Structural analysis indicates ${staticResult.bigO} worst-case complexity.`);
+        } else {
+            analysisMode = 'empirical';
+            bigO = best.bigO;
+            confidence = Math.max(0, best.adjustedR2);
+            regressionFormula = best.formula;
+            if (benchmark.errors.length > 0) {
+                warnings.push(...benchmark.errors);
+            }
+        }
         allModels = fitResult.all.map(m => ({ name: m.name, bigO: m.bigO, r2: m.r2, formula: m.formula }));
     } else {
-        // Fallback to structural analysis
         analysisMode = 'structural';
-        const staticResult = inferComplexityStatically(features, code);
         bigO = staticResult.bigO;
         confidence = staticResult.confidence;
         staticExplanation = staticResult.explanation;
 
-        // Generate theoretical curves so chart and regression always have data
         const theoreticalData = generateTheoreticalCurve(bigO, sampleSizes);
         benchmark.data.push(...theoreticalData);
 
-        // Run regression on theoretical data for model comparison
         fitResult = fitModels(benchmark.data);
         regressionFormula = `Theoretical ${bigO} — ${staticResult.explanation}`;
         allModels = fitResult.all.map(m => ({ name: m.name, bigO: m.bigO, r2: m.r2, formula: m.formula }));
     }
 
-    // 5. Space complexity
+    // 6. Space complexity
     const spaceComplexity = inferSpaceComplexity(code, features);
 
-    // 6. Adversarial analysis
+    // 7. Adversarial analysis
     const adversarial = analyzeAdversarial(features, bigO);
 
-    // 7. Phase transitions
+    // 8. Phase transitions
     const phaseTransitions = detectPhaseTransitions(benchmark.data, bigO);
 
-    // 8. Amortized cost
+    // 9. Amortized cost
     let amortizedCost = bigO;
     if (features.hasAllocation && /push|append|add/i.test(code)) {
         amortizedCost = `Amortized ${bigO} (dynamic resizing detected — occasional O(n) copy)`;
     }
 
-    // 9. Hardware estimation
+    // 10. Hardware estimation
     let hardwareCost = 'Cache-friendly — sequential access pattern';
     if (features.maxNesting >= 2) {
         hardwareCost = 'Potential cache thrashing — nested iteration over large data';
@@ -600,17 +1001,17 @@ export function analyzeCode(code: string): AnalysisResult {
         hardwareCost = 'Random memory access — hash table pointer chasing';
     }
 
-    // 10. Expected complexity (randomized algorithms)
+    // 11. Expected complexity (randomized algorithms)
     let expectedComplexity: string | null = null;
     if (features.hasRandomization) {
         expectedComplexity = `E[T] = ${bigO} (verified across randomized inputs)`;
     }
 
-    // 11. Complexity fingerprint
+    // 12. Complexity fingerprint
     const fingerprintInput = `${features.functionName}:${bigO}:${spaceComplexity}:${features.lineCount}`;
     const complexityFingerprint = `EAP-${Buffer.from(fingerprintInput).toString('base64').substring(0, 12).toUpperCase()}`;
 
-    // 12. Recursive call tree analysis
+    // 13. Recursive call tree analysis
     let recursiveCallTree = 'Iterative — no recursion detected';
     if (features.hasRecursion) {
         if (features.hasDivideConquer) {
@@ -622,16 +1023,16 @@ export function analyzeCode(code: string): AnalysisResult {
         }
     }
 
-    // 13. Parallel speedup estimation (Amdahl's Law)
+    // 14. Parallel speedup estimation (Amdahl's Law)
     let parallelFraction = 0.0;
-    if (features.loopCount > 0 && !features.hasRecursion) parallelFraction = 0.85;
-    else if (features.hasDivideConquer) parallelFraction = 0.70;
-    else if (features.maxNesting >= 2) parallelFraction = 0.90;
+    if (features.loopCount > 0 && !features.hasRecursion) {parallelFraction = 0.85;}
+    else if (features.hasDivideConquer) {parallelFraction = 0.70;}
+    else if (features.maxNesting >= 2) {parallelFraction = 0.90;}
     const cores = 8;
     const speedup = parallelFraction > 0 ? 1 / ((1 - parallelFraction) + parallelFraction / cores) : 1.0;
     const parallelSpeedupRatio = `${speedup.toFixed(1)}x on ${cores} cores (${(parallelFraction * 100).toFixed(0)}% parallelizable)`;
 
-    // 14. Input shape inference
+    // 15. Inferred input shape
     let inferredInputShape = 'Unknown';
     if (features.rawArgs) {
         inferredInputShape = `(${features.rawArgs})`;
@@ -639,7 +1040,7 @@ export function analyzeCode(code: string): AnalysisResult {
         inferredInputShape = 'Auto-detected from code structure';
     }
 
-    // 15. Complexity boundary
+    // 16. Complexity boundary
     let complexityBoundary = '> 1 billion — practically unlimited';
     if (fitResult) {
         const boundary = findComplexityBoundary(fitResult.best, 100);
@@ -647,7 +1048,6 @@ export function analyzeCode(code: string): AnalysisResult {
             ? '> 1 billion — practically unlimited'
             : `Exceeds 100ms at N ~ ${boundary.toLocaleString()}`;
     } else {
-        // Estimate from bigO class
         const boundaryMap: Record<string, string> = {
             'O(1)': '> 1 billion — practically unlimited',
             'O(log n)': '> 1 billion — practically unlimited',
@@ -660,7 +1060,7 @@ export function analyzeCode(code: string): AnalysisResult {
         complexityBoundary = boundaryMap[bigO] || 'Unknown';
     }
 
-    // 16. Certificate and grade
+    // 17. Certificate and grade
     const gradeMap: Record<string, string> = {
         'O(1)': 'S', 'O(log n)': 'S', 'O(n)': 'A',
         'O(n log n)': 'A', 'O(n^2)': 'C', 'O(n^3)': 'D', 'O(2^n)': 'F',
@@ -669,12 +1069,17 @@ export function analyzeCode(code: string): AnalysisResult {
     const modeLabel = analysisMode === 'empirical' ? 'Empirical' : 'Structural';
     const complexityCertificate = `Grade ${grade} | ${bigO} | Confidence: ${(confidence * 100).toFixed(1)}% | Mode: ${modeLabel} | Hash: ${complexityFingerprint}`;
 
-    // 17. Educational content
+    // 18. Educational content
     const edu = generateExplanation(features, bigO, analysisMode, fitResult, benchmark.data, staticExplanation);
+    
+    // Generate Ollama Pop Quiz
+    const quizQuestion = await generatePopQuiz(code, features.functionName, bigO);
 
     const analysisTimeMs = performance.now() - startTime;
 
     return {
+        isValid: true,
+        detectedLanguage: validation.detectedLanguage,
         functionName: features.functionName,
         language: features.language,
         analysisMode,
@@ -698,7 +1103,7 @@ export function analyzeCode(code: string): AnalysisResult {
         grade,
         classroomExplanation: edu.classroom,
         naturalLanguageExplanation: edu.naturalLanguage,
-        quizQuestion: edu.quiz,
+        quizQuestion,
         empiricalData: benchmark.data.length > 0 ? benchmark.data : [],
         analysisTimeMs,
         sampleSizes,

@@ -26,21 +26,21 @@ function sanitizeForVM(code: string): string {
     // Remove export keywords (keep the declarations)
     cleaned = cleaned.replace(/^\s*export\s+(default\s+)?/gm, '');
 
-    // Remove TypeScript type annotations from parameters: (x: number, y: string) -> (x, y)
-    cleaned = cleaned.replace(/(\w+)\s*:\s*(?:number|string|boolean|any|void|never|object|unknown|null|undefined)(\s*\[\s*\])?/g, '$1');
+    // Remove interface/type/enum declarations
+    cleaned = cleaned.replace(/^\s*(?:interface|type|enum)\s+\w+[\s\S]*?\n\}/gm, '');
 
-    // Remove TypeScript return type annotations: ): number { -> ) {
-    cleaned = cleaned.replace(/\)\s*:\s*(?:number|string|boolean|any|void|never|object|unknown|null|undefined)(\s*\[\s*\])?\s*\{/g, ') {');
-    cleaned = cleaned.replace(/\)\s*:\s*(?:number|string|boolean|any|void|never|object|unknown|null|undefined)(\s*\[\s*\])?\s*=>/g, ') =>');
+    // Remove type annotations on variable declarations, parameters, and returns:
+    // 1. Parameter type annotations: (x: Type, y: Type) -> (x, y)
+    cleaned = cleaned.replace(/(\(|,\s*)(\w+)\s*:\s*[^,)=]+/g, '$1$2');
 
-    // Remove interface/type declarations
-    cleaned = cleaned.replace(/^\s*(?:interface|type)\s+\w+[\s\S]*?\n\}/gm, '');
+    // 2. Return type annotations: ): Type { -> ) {
+    cleaned = cleaned.replace(/\)\s*:\s*[^{=]+(?=\s*[{=])/g, ')');
 
-    // Remove generic type parameters: Array<number> -> Array, Map<string, number> -> Map
-    cleaned = cleaned.replace(/<(?:number|string|boolean|any|void|object|unknown|null|undefined)(?:\s*\[\s*\])?(?:\s*,\s*(?:number|string|boolean|any|void|object|unknown|null|undefined)(?:\s*\[\s*\])?)*>/g, '');
+    // 3. Variable type annotations: let x: Type = ... -> let x = ...
+    cleaned = cleaned.replace(/\b(const|let|var)\s+(\w+)\s*:\s*[^;=]+/g, '$1 $2');
 
-    // Remove `as` type assertions
-    cleaned = cleaned.replace(/\s+as\s+\w+/g, '');
+    // Remove generic type parameters from function calls/declarations: function foo<T>(...)
+    cleaned = cleaned.replace(/<\s*[A-Za-z_$][A-Za-z0-9_$]*\s*>/g, '');
 
     // Remove access modifiers (public, private, protected, readonly)
     cleaned = cleaned.replace(/\b(public|private|protected|readonly)\s+/g, '');
@@ -65,6 +65,16 @@ export function isExecutableLanguage(code: string): boolean {
     if (/#include|printf|scanf|int\s+main\s*\(/.test(code)) {
         return false;
     }
+    // Shell scripts / Bash / PowerShell / Batch
+    if (/\b(do|done|then|fi|elif)\b/.test(code) || /#!\/(bin|usr)/.test(code)) {
+        return false;
+    }
+    if (/\b(Get-Command|Write-Output|Get-Process|Write-Host|Get-ChildItem)\b/i.test(code)) {
+        return false;
+    }
+    if (/\b(echo\s+off|setlocal|exit\s+\/b)\b/i.test(code)) {
+        return false;
+    }
     return true;
 }
 
@@ -76,7 +86,7 @@ export function generateInput(code: string, n: number): any[] {
     if (/:\s*string|param.*string|str\s*[,)]/i.test(code)) {
         const chars = 'abcdefghijklmnopqrstuvwxyz';
         let str = '';
-        for (let i = 0; i < n; i++) str += chars[Math.floor(Math.random() * chars.length)];
+        for (let i = 0; i < n; i++) {str += chars[Math.floor(Math.random() * chars.length)];}
         return [str];
     }
 

@@ -22,8 +22,13 @@ export function activate(context: vscode.ExtensionContext) {
 			title: "EAP: Profiling complexity...",
 			cancellable: false
 		}, async () => {
-			const result = analyzeCode(code);
-			showResultWebview(context, result);
+			try {
+				const languageId = editor.document.languageId;
+				const result = await analyzeCode(code, languageId);
+				showResultWebview(context, result);
+			} catch (err: any) {
+				vscode.window.showErrorMessage(`EAP: Analysis failed - ${err.message || err}`);
+			}
 		});
 	});
 
@@ -33,7 +38,7 @@ export function activate(context: vscode.ExtensionContext) {
 function showResultWebview(context: vscode.ExtensionContext, result: AnalysisResult) {
 	const panel = vscode.window.createWebviewPanel(
 		'eapResult',
-		`EAP: ${result.functionName} -> ${result.timeComplexity}`,
+		result.isValid ? `EAP: ${result.functionName} -> ${result.timeComplexity}` : 'EAP: Invalid Selection',
 		vscode.ViewColumn.Beside,
 		{ enableScripts: true }
 	);
@@ -42,6 +47,109 @@ function showResultWebview(context: vscode.ExtensionContext, result: AnalysisRes
 }
 
 function getWebviewContent(result: AnalysisResult) {
+	if (!result.isValid) {
+		return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>EAP: Invalid Selection</title>
+	<style>
+		body {
+			font-family: var(--vscode-font-family);
+			padding: 40px 24px;
+			color: var(--vscode-editor-foreground);
+			background-color: var(--vscode-editor-background);
+			display: flex;
+			justify-content: center;
+			align-items: center;
+			min-height: 80vh;
+		}
+		.error-container {
+			max-width: 600px;
+			background: rgba(255, 193, 7, 0.05);
+			border: 1px solid rgba(255, 193, 7, 0.3);
+			border-radius: 12px;
+			padding: 32px;
+			box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+			backdrop-filter: blur(8px);
+			text-align: center;
+		}
+		.error-icon {
+			font-size: 3em;
+			margin-bottom: 16px;
+			color: #ffc107;
+		}
+		h1 {
+			margin: 0 0 16px 0;
+			font-size: 1.6em;
+			color: #ffc107;
+			font-weight: 700;
+		}
+		p {
+			font-size: 1.15em;
+			line-height: 1.6;
+			margin: 0 0 24px 0;
+			opacity: 0.9;
+		}
+		.reason-box {
+			background: rgba(0, 0, 0, 0.2);
+			border-left: 4px solid #ff5722;
+			padding: 12px 16px;
+			text-align: left;
+			font-family: var(--vscode-editor-font-family);
+			font-size: 0.95em;
+			margin-bottom: 24px;
+			border-radius: 0 6px 6px 0;
+		}
+		.support-list {
+			text-align: left;
+			background: rgba(128, 128, 128, 0.05);
+			border-radius: 8px;
+			padding: 16px 20px;
+			border: 1px solid rgba(128, 128, 128, 0.1);
+		}
+		.support-list h2 {
+			font-size: 1em;
+			margin-top: 0;
+			color: var(--vscode-textLink-foreground);
+			border-bottom: 1px solid rgba(128,128,128,0.15);
+			padding-bottom: 6px;
+		}
+		.support-list ul {
+			margin: 0;
+			padding-left: 20px;
+		}
+		.support-list li {
+			margin-bottom: 6px;
+			font-size: 0.95em;
+		}
+	</style>
+</head>
+<body>
+	<div class="error-container">
+		<div class="error-icon">⚠️</div>
+		<h1>EAP: Analysis Not Suitable</h1>
+		<p>The selected text is not suitable for complexity profiling. To perform asymptotic profiling, select a valid function declaration, class method, or an OS-based scripting block.</p>
+		
+		<div class="reason-box">
+			<strong>Details:</strong> ${result.validationError || 'No valid code structures detected.'}
+		</div>
+
+		<div class="support-list">
+			<h2>Supported Languages & Code Elements:</h2>
+			<ul>
+				<li><strong>Programming Languages:</strong> JavaScript, TypeScript, Python, Java, C, C++ (requires a function declaration, e.g., <code>function foo() {}</code> or <code>def bar():</code>).</li>
+				<li><strong>OS Shell Scripting:</strong> Bash, PowerShell, Batch scripts (supports loops like <code>for / while / do / until</code> and recursive call structures).</li>
+			</ul>
+		</div>
+	</div>
+</body>
+</html>
+`;
+	}
+
 	const confidencePercent = (result.confidence * 100).toFixed(1);
 	const gradeColors: Record<string, string> = {
 		'S': '#00e676', 'A': '#76ff03', 'B': '#8bc34a', 'C': '#ffc107', 'D': '#ff5722', 'F': '#f44336',

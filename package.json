@@ -4,6 +4,10 @@
   "description": "",
   "version": "0.0.1",
   "publisher": "satoru",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shivarajm8234/empirical-asymptotic-profiler.git"
+  },
   "engines": {
     "vscode": "^1.93.0"
   },
